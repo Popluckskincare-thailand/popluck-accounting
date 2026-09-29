@@ -32,6 +32,49 @@ const dTH = d => { if(!d) return '—'; const x=new Date(d+'T00:00:00');
 const today = () => new Date().toISOString().slice(0,10);
 const ym = d => String(d).slice(0,7);
 
+// ---------- ช่องกรอกตัวเลขแบบมีคอมมาอัตโนมัติ ----------
+// type="number" ใส่คอมมาไม่ได้ตามสเปกเบราว์เซอร์ จึงใช้ช่องข้อความแล้วจัดรูปแบบเอง
+function fmtMoneyStr(v){
+  let s = String(v).replace(/[^\d.]/g, '');
+  const i = s.indexOf('.');
+  if (i >= 0) s = s.slice(0, i + 1) + s.slice(i + 1).replace(/\./g, '').slice(0, 2);
+  let [a, b] = s.split('.');
+  a = (a || '').replace(/^0+(?=\d)/, '');
+  a = a.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  return b !== undefined ? a + '.' + b : a;
+}
+
+// อ่านค่าตัวเลขจากช่องที่มีคอมมา
+const numOf = el => +String(el?.value || '').replace(/,/g, '') || 0;
+
+function attachMoney(el){
+  if (!el || el.dataset.money) return;
+  el.dataset.money = '1';
+  el.type = 'text';
+  el.inputMode = 'decimal';
+  el.autocomplete = 'off';
+  const run = () => {
+    // นับจำนวนตัวเลขก่อนเคอร์เซอร์ไว้ เพื่อวางเคอร์เซอร์กลับที่เดิมหลังใส่คอมมา
+    const caret = el.selectionStart ?? el.value.length;
+    const before = el.value.slice(0, caret).replace(/[^\d.]/g, '').length;
+    el.value = fmtMoneyStr(el.value);
+    let pos = 0, seen = 0;
+    while (pos < el.value.length && seen < before) {
+      if (/[\d.]/.test(el.value[pos])) seen++;
+      pos++;
+    }
+    try { el.setSelectionRange(pos, pos); } catch(e) {}
+  };
+  el.addEventListener('input', run);
+  el.addEventListener('focus', ()=>{ if(el.value==='0') el.value=''; });
+  el.addEventListener('blur',  ()=>{ if(el.value==='') el.value='0'; });
+  if (el.value !== '') run();
+}
+
+// เปลี่ยนทุกช่องตัวเลขใน element ที่กำหนดให้มีคอมมา
+const moneyAll = (root=document) =>
+  [...root.querySelectorAll('input[data-money-field]')].forEach(attachMoney);
+
 let toastT;
 function toast(msg, err=false){
   const t=$('#toast'); t.textContent=msg; t.className='on'+(err?' err':'');
@@ -41,6 +84,50 @@ function toast(msg, err=false){
 async function api(fn, what='ทำรายการ'){
   try { const {data,error}=await fn(); if(error) throw error; return data; }
   catch(e){ console.error(e); toast(`${what}ไม่สำเร็จ: ${e.message||e}`, true); throw e; }
+}
+
+// ---------- ใบเสร็จ ----------
+const RCPT_BUCKET = 'receipts';
+const MAX_RCPT = 10 * 1024 * 1024;   // 10 MB
+
+// ย่อรูปก่อนอัปโหลด — รูปจากมือถือ 4MB เหลือ ~300KB พื้นที่ฟรี 1GB จะอยู่ได้นานขึ้นมาก
+async function shrinkImage(file, maxPx = 1600, quality = 0.82){
+  if (!file.type.startsWith('image/') || file.type === 'image/heic' || file.type === 'image/heif')
+    return file;   // HEIC วาดลง canvas ไม่ได้ทุกเบราว์เซอร์ ส่งไฟล์เดิมไปเลย
+  try{
+    const bmp = await createImageBitmap(file);
+    const scale = Math.min(1, maxPx / Math.max(bmp.width, bmp.height));
+    if (scale === 1 && file.size < 900 * 1024) return file;
+    const c = document.createElement('canvas');
+    c.width = Math.round(bmp.width * scale);
+    c.height = Math.round(bmp.height * scale);
+    c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+    const blob = await new Promise(r => c.toBlob(r, 'image/jpeg', quality));
+    if (!blob || blob.size >= file.size) return file;
+    return new File([blob], file.name.replace(/\.[^.]+$/, '') + '.jpg', { type: 'image/jpeg' });
+  }catch(e){ return file; }
+}
+
+async function uploadReceipt(file, txnId){
+  const small = await shrinkImage(file);
+  if (small.size > MAX_RCPT) throw new Error('ไฟล์ใหญ่เกิน 10 MB');
+  const ext  = (small.name.split('.').pop() || 'bin').toLowerCase();
+  const path = `${new Date().getFullYear()}/${txnId}-${Date.now()}.${ext}`;
+  const { error } = await sb.storage.from(RCPT_BUCKET)
+    .upload(path, small, { contentType: small.type, upsert: false });
+  if (error) throw error;
+  return path;
+}
+
+// ถังเป็นส่วนตัว ต้องขอลิงก์ชั่วคราว (อายุ 5 นาที) ทุกครั้งที่จะเปิดดู
+async function openReceipt(path){
+  const { data, error } = await sb.storage.from(RCPT_BUCKET).createSignedUrl(path, 300);
+  if (error || !data?.signedUrl) return toast('เปิดใบเสร็จไม่ได้: ' + (error?.message || 'ไม่พบไฟล์'), true);
+  window.open(data.signedUrl, '_blank', 'noopener');
+}
+
+async function removeReceipt(path){
+  try{ await sb.storage.from(RCPT_BUCKET).remove([path]); }catch(e){}
 }
 
 // ---------- ล็อกอิน ----------
@@ -230,6 +317,7 @@ function render(){
   const c=$('#content');
   ({dash:pgDash,income:pgIncome,expense:pgExpense,wht:pgWht,
     calendar:pgCalendar,assets:pgAssets,reports:pgReports,settings:pgSettings})[S.page](c);
+  moneyAll(c);
 }
 
 // ---------- ไอคอนว่าง ----------
@@ -335,6 +423,7 @@ function pgDash(el){
     ${txnTable(real.slice(0,10), false)}</div>`;
 
   $('#dirRepay')?.addEventListener('click', repayModal);
+  $$('[data-rcpt]',el).forEach(b=>b.onclick=()=>openReceipt(b.dataset.rcpt));
 }
 
 function chart12(){
@@ -371,7 +460,14 @@ function txnTable(rows, editable=true){
       <td style="white-space:nowrap">${dTH(t.txn_date)}</td>
       <td><div>${esc(t.description)}</div>
         ${t.doc_no?`<div style="font-size:11.5px;color:var(--ink-3)">เลขที่ ${esc(t.doc_no)}</div>`:''}
-        ${t.source==='order'?'<span class="tag b" style="margin-top:3px">จากออเดอร์</span>':''}</td>
+        <div style="display:flex;gap:5px;flex-wrap:wrap;margin-top:3px">
+        ${t.source==='order'?'<span class="tag b">จากออเดอร์</span>':''}
+        ${t.receipt_url
+          ? `<button class="tag g" style="cursor:pointer;border:none" data-rcpt="${esc(t.receipt_url)}"
+               title="เปิดดูใบเสร็จ">📎 ใบเสร็จ</button>`
+          : (t.direction==='out' && t.source!=='order'
+              ? '<span class="tag a" title="ยังไม่ได้แนบหลักฐาน">ไม่มีใบเสร็จ</span>' : '')}
+        </div></td>
       <td><span class="tag n">${esc(c?.name||'—')}</span></td>
       <td class="n">${B(t.amount)}</td>
       <td class="n" style="color:${+t.vat_amount?'var(--ink-2)':'var(--ink-3)'}">${+t.vat_amount?B(t.vat_amount):'—'}</td>
@@ -385,6 +481,7 @@ function txnTable(rows, editable=true){
 }
 
 function wireTxnTable(el, dir){
+  $$('[data-rcpt]',el).forEach(b=>b.onclick=()=>openReceipt(b.dataset.rcpt));
   $$('[data-edit]',el).forEach(b=>b.onclick=()=>
     txnModal(dir, S.txns.find(t=>t.id==b.dataset.edit)));
   $$('[data-del]',el).forEach(b=>b.onclick=async()=>{
@@ -424,7 +521,13 @@ function pgExpense(el){
   const rows=periodTxns().filter(t=>t.direction==='out' && !isTransfer(t));
   const sum=rows.reduce((s,t)=>s+ +t.amount + +t.vat_amount,0);
   const vat=rows.reduce((s,t)=>s+ +t.vat_amount,0);
+  const noRcpt = rows.filter(t=>!t.receipt_url && t.source!=='order');
   el.innerHTML=`
+  ${noRcpt.length?`<div class="alert warn">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+    <div><b>ยังไม่ได้แนบใบเสร็จ ${noRcpt.length} รายการ</b>
+    สรรพากรขอดูหลักฐานตอนตรวจ ถ้าไม่มีใบเสร็จอาจถูกตัดออกจากรายจ่าย ทำให้ต้องจ่ายภาษีเพิ่ม
+    — กด "แก้" ที่รายการนั้นแล้วแนบไฟล์ได้เลย</div></div>`:''}
   ${vat>0?`<div class="alert info">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
     <div><b>VAT ที่จ่ายไปในช่วงนี้ ${B(vat)} บาท</b>
@@ -447,6 +550,7 @@ function modal(title, body, footer){
       <button class="x" aria-label="ปิด"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"/></svg></button></div>
     <div class="modal-b">${body}</div>
     <div class="modal-f">${footer}</div></div></div>`;
+  moneyAll(host);
   const close=()=>host.innerHTML='';
   $('.x',host).onclick=close;
   $('.mask',host).onclick=e=>{ if(e.target===$('.mask',host)) close(); };
@@ -474,12 +578,12 @@ function txnModal(dir, t=null){
         ${cats.map(c=>`<option value="${c.id}" data-wht="${c.wht_rate??''}" ${t?.category_id===c.id?'selected':''}>${esc(c.name)}</option>`).join('')}
       </select></div>
       <div class="f"><label>ยอดตามบิล (ก่อน VAT) <span class="req">*</span></label>
-        <input type="number" id="fAmt" step="0.01" min="0" value="${t?.amount??''}" placeholder="0.00"></div></div>
+        <input data-money-field id="fAmt" value="${t?.amount??''}" placeholder="0.00"></div></div>
 
     ${isOut?`
     <div class="grid2">
       <div class="f"><label>VAT 7% ที่จ่ายไป</label>
-        <div class="f-row"><input type="number" id="fVat" step="0.01" min="0" value="${t?.vat_amount??0}">
+        <div class="f-row"><input data-money-field id="fVat" value="${t?.vat_amount??0}">
           <button class="btn btn-sm" id="fVatCalc" type="button">คิด 7%</button></div>
         <div class="help">ขอคืนไม่ได้ ถือเป็นต้นทุน</div></div>
       <div class="f"><label>หักภาษี ณ ที่จ่าย</label>
@@ -491,7 +595,7 @@ function txnModal(dir, t=null){
             <option value="3">3% ค่าบริการ/รับจ้างทำของ</option>
             <option value="5">5% ค่าเช่า</option>
           </select>
-          <input type="number" id="fWht" step="0.01" min="0" style="width:110px" value="${t?.wht_amount??0}"></div>
+          <input data-money-field id="fWht" style="width:120px" value="${t?.wht_amount??0}"></div>
         <div class="help" id="whtHelp">เงินส่วนนี้ไม่จ่ายให้ผู้ขาย ต้องนำส่งสรรพากร</div></div></div>
 
     <div class="f"><label>ผู้รับเงิน</label>
@@ -507,11 +611,16 @@ function txnModal(dir, t=null){
         <input id="fDoc" value="${esc(t?.doc_no||'')}" placeholder="เลขที่ใบเสร็จ/ใบกำกับ"></div>
       <div class="f"><label>${isOut?'เงินที่จ่ายจริง':'เงินที่รับจริง'}</label>
         <input id="fPaid" readonly class="num" value="${B(t?.paid_amount||0)}"></div></div>
+    <div class="f"><label>ใบเสร็จ / หลักฐานการจ่าย</label>
+      <div id="fRcptBox"></div>
+      <input type="file" id="fRcptFile" accept="image/*,application/pdf" style="display:none">
+      <div class="help">ถ่ายรูปใบเสร็จหรือแนบ PDF ก็ได้ — รูปจะถูกย่อให้อัตโนมัติ
+        ${isOut?'· สรรพากรขอดูหลักฐานตอนตรวจ ควรแนบทุกรายการ':''}</div></div>
     <div class="f"><label>หมายเหตุ</label><input id="fNote" value="${esc(t?.note||'')}"></div>`,
     `<button class="btn" id="mCancel">ยกเลิก</button>
      <button class="btn btn-p" id="mSave">${t?'บันทึกการแก้ไข':'บันทึก'}</button>`);
 
-  const g=id=>$('#'+id), num=id=>+g(id).value||0;
+  const g=id=>$('#'+id), num=id=>numOf(g(id));
   const recalc=()=>{
     const a=num('fAmt'), v=isOut?num('fVat'):0, w=isOut?num('fWht'):0;
     g('fPaid').value=B(a+v-w);
@@ -520,9 +629,11 @@ function txnModal(dir, t=null){
 
   if(isOut){
     ['fVat','fWht'].forEach(i=>g(i).oninput=recalc);
-    g('fVatCalc').onclick=()=>{ g('fVat').value=(num('fAmt')*VAT_RATE).toFixed(2); recalc(); };
+    // เติมค่าให้ช่องพร้อมจัดคอมมา (ตั้ง .value ตรง ๆ ตัวจัดรูปแบบจะไม่ทำงาน)
+    const setMoney=(id,v)=>{ g(id).value = fmtMoneyStr((+v||0).toFixed(2)); };
+    g('fVatCalc').onclick=()=>{ setMoney('fVat', num('fAmt')*VAT_RATE); recalc(); };
     const applyRate=()=>{ const r=+g('fWhtRate').value||0;
-      if(r) g('fWht').value=(num('fAmt')*r/100).toFixed(2); else g('fWht').value=0; recalc(); };
+      setMoney('fWht', r ? num('fAmt')*r/100 : 0); recalc(); };
     g('fWhtRate').onchange=applyRate;
     g('fAmt').addEventListener('input',()=>{ if(+g('fWhtRate').value) applyRate(); });
     g('fCat').onchange=()=>{ const r=g('fCat').selectedOptions[0]?.dataset.wht;
@@ -551,6 +662,41 @@ function txnModal(dir, t=null){
     });
   }
   recalc();
+
+  // ---- ใบเสร็จ ----
+  let rcptPath = t?.receipt_url || '';   // ไฟล์ที่เก็บไว้แล้ว
+  let rcptNew  = null;                   // ไฟล์ใหม่ที่เพิ่งเลือก (ยังไม่อัป)
+  let rcptDrop = false;                  // สั่งลบไฟล์เดิม
+  const paintRcpt = ()=>{
+    const box = $('#fRcptBox');
+    if(rcptNew){
+      box.innerHTML = `<div class="f-row" style="align-items:center">
+        <span class="tag b" style="max-width:100%;overflow:hidden;text-overflow:ellipsis">
+          ${esc(rcptNew.name)} · ${(rcptNew.size/1024).toFixed(0)} KB</span>
+        <button class="btn btn-sm btn-d" type="button" id="rcptClear">เอาออก</button></div>`;
+      $('#rcptClear').onclick = ()=>{ rcptNew=null; $('#fRcptFile').value=''; paintRcpt(); };
+    } else if(rcptPath && !rcptDrop){
+      box.innerHTML = `<div class="f-row" style="align-items:center">
+        <span class="tag g">แนบไว้แล้ว</span>
+        <button class="btn btn-sm" type="button" id="rcptView">เปิดดู</button>
+        <button class="btn btn-sm" type="button" id="rcptSwap">เปลี่ยนไฟล์</button>
+        ${isOwner()?'<button class="btn btn-sm btn-d" type="button" id="rcptDel">ลบ</button>':''}</div>`;
+      $('#rcptView').onclick = ()=>openReceipt(rcptPath);
+      $('#rcptSwap').onclick = ()=>$('#fRcptFile').click();
+      const d=$('#rcptDel'); if(d) d.onclick = ()=>{ rcptDrop=true; paintRcpt(); };
+    } else {
+      box.innerHTML = `<button class="btn" type="button" id="rcptPick">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+        แนบใบเสร็จ</button>`;
+      $('#rcptPick').onclick = ()=>$('#fRcptFile').click();
+    }
+  };
+  $('#fRcptFile').onchange = e=>{
+    const f = e.target.files?.[0]; if(!f) return;
+    if(f.size > MAX_RCPT) return toast('ไฟล์ใหญ่เกิน 10 MB', true);
+    rcptNew = f; rcptDrop = false; paintRcpt();
+  };
+  paintRcpt();
 
   $('#mCancel').onclick=m.close;
   $('#mSave').onclick=async()=>{
@@ -588,6 +734,24 @@ function txnModal(dir, t=null){
         }),'บันทึกหนังสือรับรอง');
       }
     }
+    // ---- จัดการไฟล์ใบเสร็จ หลังได้ id ของรายการแล้ว ----
+    try{
+      let finalPath = rcptDrop ? '' : rcptPath;
+      if(rcptNew){
+        $('#mSave').textContent = 'กำลังอัปโหลดใบเสร็จ…';
+        const up = await uploadReceipt(rcptNew, txnId);
+        if(rcptPath) await removeReceipt(rcptPath);   // เปลี่ยนไฟล์ = ลบของเก่าทิ้ง
+        finalPath = up;
+      } else if(rcptDrop && rcptPath){
+        await removeReceipt(rcptPath);
+      }
+      if(finalPath !== (t?.receipt_url || ''))
+        await sb.from('acc_transactions').update({ receipt_url: finalPath }).eq('id', txnId);
+    }catch(e){
+      console.error(e);
+      toast('บันทึกรายการแล้ว แต่แนบใบเสร็จไม่สำเร็จ: ' + (e.message||e), true);
+    }
+
     m.close(); await loadAll(); render();
     toast(t?'บันทึกการแก้ไขแล้ว':'บันทึกรายการแล้ว');
   };
@@ -619,7 +783,7 @@ function repayModal(){
 
     <div class="f"><label>จำนวนเงินที่คืน <span class="req">*</span></label>
       <div class="f-row">
-        <input type="number" id="rAmt" step="0.01" min="0" max="${owed}" value="${owed.toFixed(2)}">
+        <input data-money-field id="rAmt" value="${owed.toFixed(2)}">
         <button class="btn btn-sm" type="button" id="rAll">คืนทั้งหมด</button></div>
       <div class="help">ยอดค้างคืนทั้งหมด ${B(owed)} บาท · คืนบางส่วนได้</div></div>
 
@@ -629,10 +793,10 @@ function repayModal(){
     `<button class="btn" id="rCancel">ยกเลิก</button>
      <button class="btn btn-p" id="rSave">บันทึกการคืนเงิน</button>`);
 
-  $('#rAll').onclick = ()=>{ $('#rAmt').value = owed.toFixed(2); };
+  $('#rAll').onclick = ()=>{ $('#rAmt').value = fmtMoneyStr(owed.toFixed(2)); };
   $('#rCancel').onclick = m.close;
   $('#rSave').onclick = async ()=>{
-    const amt = +$('#rAmt').value || 0;
+    const amt = numOf($('#rAmt'));
     if(amt <= 0)    return toast('กรอกจำนวนเงินก่อน', true);
     if(amt > owed + 0.005) return toast(`คืนได้ไม่เกินยอดค้าง ${B(owed)} บาท`, true);
     const d = $('#rDate').value, note = $('#rNote').value.trim();
@@ -899,21 +1063,21 @@ function assetModal(){
      <div class="grid2">
       <div class="f"><label>วันที่ได้มา</label><input type="date" id="aDate" value="${today()}"></div>
       <div class="f"><label>ราคาทุน <span class="req">*</span></label>
-        <input type="number" id="aCost" step="0.01" min="0" placeholder="0.00"></div></div>
+        <input data-money-field id="aCost" placeholder="0.00"></div></div>
      <div class="grid2">
       <div class="f"><label>อายุการใช้งาน (ปี)</label><input type="number" id="aLife" value="5" min="1">
         <div class="help">สรรพากรกำหนด: คอมพิวเตอร์ 3 ปี · เครื่องใช้สำนักงาน 5 ปี · อาคาร 20 ปี</div></div>
-      <div class="f"><label>มูลค่าซาก</label><input type="number" id="aSalv" value="1" step="0.01" min="0">
+      <div class="f"><label>มูลค่าซาก</label><input data-money-field id="aSalv" value="1">
         <div class="help">นิยมตั้งไว้ 1 บาท</div></div></div>
      <div class="f"><label>หมายเหตุ</label><input id="aNote"></div>`,
     `<button class="btn" id="aCancel">ยกเลิก</button><button class="btn btn-p" id="aSave">บันทึก</button>`);
   $('#aCancel').onclick=m.close;
   $('#aSave').onclick=async()=>{
-    const name=$('#aName').value.trim(), cost=+$('#aCost').value||0;
+    const name=$('#aName').value.trim(), cost=numOf($('#aCost'));
     if(!name) return toast('กรอกชื่อทรัพย์สินก่อน',true);
     if(cost<=0) return toast('กรอกราคาทุนก่อน',true);
     await api(()=>sb.from('acc_assets').insert({name, acquired_date:$('#aDate').value,
-      cost, salvage:+$('#aSalv').value||0, life_years:+$('#aLife').value||5,
+      cost, salvage:numOf($('#aSalv')), life_years:+$('#aLife').value||5,
       note:$('#aNote').value.trim()}),'บันทึก');
     m.close(); await loadAll(); render(); toast('เพิ่มทรัพย์สินแล้ว');
   };
@@ -1017,7 +1181,7 @@ function pgSettings(el){
           <option value="false" ${!st.vat_registered?'selected':''}>ยังไม่จดทะเบียน VAT</option>
           <option value="true" ${st.vat_registered?'selected':''}>จดทะเบียน VAT แล้ว</option></select></div>
         <div class="f"><label>เพดานรายได้ที่ต้องจด VAT</label>
-          <input type="number" id="sCap" value="${st.vat_threshold||1800000}">
+          <input data-money-field id="sCap" value="${st.vat_threshold||1800000}">
           <div class="help">กฎหมายกำหนด 1,800,000 บาท/ปี</div></div></div>
       <div><button class="btn btn-p" id="sSave">บันทึก</button></div>
     </div></div>
@@ -1054,7 +1218,7 @@ function pgSettings(el){
     await api(()=>sb.from('acc_settings').update({
       company_name:$('#sName').value.trim(), tax_id:$('#sTax').value.trim(),
       branch:$('#sBranch').value.trim(), address:$('#sAddr').value.trim(),
-      vat_registered:$('#sVat').value==='true', vat_threshold:+$('#sCap').value||1800000,
+      vat_registered:$('#sVat').value==='true', vat_threshold:numOf($('#sCap'))||1800000,
     }).eq('id',1),'บันทึกตั้งค่า');
     await loadAll(); render(); toast('บันทึกแล้ว');
   };
