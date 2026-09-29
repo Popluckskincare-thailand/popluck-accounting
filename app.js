@@ -254,6 +254,11 @@ function buildPeriods(){
   sel.onchange = ()=>{ S.period=sel.value; render(); };
 }
 
+// เรียงเก่าไปใหม่ — ลำดับสมุดบัญชี วันที่เท่ากันให้เรียงตามลำดับที่บันทึก
+const byDate = k => (a,b) =>
+  String(a[k]).localeCompare(String(b[k])) || (a.id - b.id);
+const sortAsc = (arr, k='txn_date') => [...arr].sort(byDate(k));
+
 const inPeriod = d => S.period.length===4 ? String(d).startsWith(S.period)
                                           : ym(d)===S.period;
 const periodTxns = () => S.txns.filter(t=>inPeriod(t.txn_date));
@@ -420,7 +425,7 @@ function pgDash(el){
 
   <div class="card" style="margin-top:20px"><div class="card-h"><h2>รายการล่าสุด</h2>
     <span class="hint">${whtDue>0?`ยังไม่ยื่น ภ.ง.ด. ${B(whtDue)} บาท`:''}</span></div>
-    ${txnTable(real.slice(0,10), false)}</div>`;
+    ${txnTable(sortAsc(real).slice(-10).reverse(), false)}</div>`;
 
   $('#dirRepay')?.addEventListener('click', repayModal);
   $$('[data-rcpt]',el).forEach(b=>b.onclick=()=>openReceipt(b.dataset.rcpt));
@@ -496,7 +501,7 @@ function wireTxnTable(el, dir){
 //  รายรับ / รายจ่าย
 // ===================================================================
 function pgIncome(el){
-  const rows=periodTxns().filter(t=>t.direction==='in' && !isTransfer(t));
+  const rows=sortAsc(periodTxns().filter(t=>t.direction==='in' && !isTransfer(t)));
   const sum=rows.reduce((s,t)=>s+ +t.amount,0);
   el.innerHTML=`
   <div class="card"><div class="card-h">
@@ -518,7 +523,7 @@ function pgIncome(el){
 }
 
 function pgExpense(el){
-  const rows=periodTxns().filter(t=>t.direction==='out' && !isTransfer(t));
+  const rows=sortAsc(periodTxns().filter(t=>t.direction==='out' && !isTransfer(t)));
   const sum=rows.reduce((s,t)=>s+ +t.amount + +t.vat_amount,0);
   const vat=rows.reduce((s,t)=>s+ +t.vat_amount,0);
   const noRcpt = rows.filter(t=>!t.receipt_url && t.source!=='order');
@@ -836,7 +841,7 @@ function vendorModal(done){
 //  ภาษีหัก ณ ที่จ่าย
 // ===================================================================
 function pgWht(el){
-  const rows=S.wht.filter(w=>inPeriod(w.pay_date));
+  const rows=sortAsc(S.wht.filter(w=>inPeriod(w.pay_date)), 'pay_date');
   const p3=rows.filter(w=>w.form_type==='PND3'), p53=rows.filter(w=>w.form_type==='PND53');
   const sum=a=>a.reduce((s,w)=>s+ +w.tax_amount,0);
   const unfiled=rows.filter(w=>!w.filed);
@@ -889,7 +894,7 @@ function pgWht(el){
   });
   $('#csv').onclick=()=>exportCSV(`wht-${S.period}`,
     ['วันที่จ่าย','ผู้รับเงิน','เลขผู้เสียภาษี','ประเภทเงินได้','แบบ','ยอดจ่าย','อัตรา%','ภาษีที่หัก','ยื่นแล้ว'],
-    rows.map(w=>[w.pay_date,w.vendor_name,w.vendor_tax_id,w.income_type,
+    sortAsc(rows,'pay_date').map(w=>[w.pay_date,w.vendor_name,w.vendor_tax_id,w.income_type,
       w.form_type==='PND3'?'ภ.ง.ด.3':'ภ.ง.ด.53',w.base_amount,w.rate,w.tax_amount,w.filed?'ใช่':'ไม่']));
 }
 
@@ -1018,7 +1023,7 @@ function depToDate(a, upto=new Date()){
 }
 
 function pgAssets(el){
-  const rows=S.assets.filter(a=>!a.disposed_date);
+  const rows=sortAsc(S.assets.filter(a=>!a.disposed_date), 'acquired_date');
   const cost=rows.reduce((s,a)=>s+ +a.cost,0);
   const acc=rows.reduce((s,a)=>s+depToDate(a),0);
   el.innerHTML=`
@@ -1146,7 +1151,7 @@ function pgReports(el){
   $('#print').onclick=()=>window.print();
   $('#csvAll').onclick=()=>exportCSV(`บัญชี-${S.period}`,
     ['วันที่','ประเภท','หมวด','รายละเอียด','ผู้รับเงิน','ยอดตามบิล','VAT','หัก ณ ที่จ่าย','เงินจริง','เลขที่เอกสาร'],
-    tx.map(t=>[t.txn_date, t.direction==='in'?'รายรับ':'รายจ่าย',
+    sortAsc(tx).map(t=>[t.txn_date, t.direction==='in'?'รายรับ':'รายจ่าย',
       catById(t.category_id)?.name||'', t.description,
       S.vendors.find(v=>v.id===t.vendor_id)?.name||'',
       t.amount, t.vat_amount, t.wht_amount, t.paid_amount, t.doc_no]));
